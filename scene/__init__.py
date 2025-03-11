@@ -22,7 +22,9 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args: ModelParams, gaussians: GaussianModel,
+                 load_iteration=None, shuffle=True, resolution_scales=[1.0],
+                 min_cell_size=0.01, max_gaussians_per_node=20):
         """b
         :param path: Path to colmap scene main folder.
         """

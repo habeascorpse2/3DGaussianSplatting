@@ -12,6 +12,7 @@
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from scene.octree import Octree  # Importe sua classe Octree
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -121,30 +122,155 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    # def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    #     self.spatial_lr_scale = spatial_lr_scale
+    #     fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+    #     fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+    #     features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+    #     features[:, :3, 0 ] = fused_color
+    #     features[:, 3:, 1:] = 0.0
+
+    #     print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+    #     dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+    #     scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+    #     rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+    #     rots[:, 0] = 1
+
+    #     opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+    #     self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+    #     self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+    #     self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+    #     self._scaling = nn.Parameter(scales.requires_grad_(True))
+    #     self._rotation = nn.Parameter(rots.requires_grad_(True))
+    #     self._opacity = nn.Parameter(opacities.requires_grad_(True))
+    #     self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
+        """
+        Inicializa os parâmetros dos gaussianos a partir do point cloud 'pcd' e constrói uma Octree
+        dinâmica que não se subdivide além de um tamanho mínimo de célula (definido por min_cell_size).
+        
+        Para cada ponto:
+        - As posições são convertidas para tensor;
+        - São atribuídas escalas e rotações iniciais padrão (dummy), que poderão ser atualizadas.
+        - A Octree é construída usando os pontos, escalas e rotações iniciais.
+        - A escala padrão para os gaussianos é definida como um quarto do tamanho da célula da Octree.
+        - Se o bounding box do ponto (p ± default_extent) se estender por mais de uma célula, o ponto
+            é inserido em todas elas.
+        
+        Durante o treinamento, se houver alterações nos parâmetros dos gaussianos, os métodos
+        update_point, insert_point ou remove_point da Octree deverão ser chamados para manter a consistência.
+        
+        :param pcd: Instância de BasicPointCloud contendo pontos e cores.
+        :param spatial_lr_scale: Escala de aprendizado para os parâmetros espaciais.
+        """
         self.spatial_lr_scale = spatial_lr_scale
+        # Converte os pontos para tensor e array NumPy
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        points_np = fused_point_cloud.cpu().numpy()
+        
+        # Processa as cores para gerar os features usando RGB2SH
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
+        features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
-
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        print("Número de pontos na inicialização:", fused_point_cloud.shape[0])
+        
+        # Para a construção da Octree dinâmica, definimos escalas e rotações iniciais "dummy".
+        # Inicialmente, sem informações específicas, usamos:
+        #   - dummy_scale: vetor de uns (forma (N, 3))
+        #   - dummy_rotations: matriz identidade para cada ponto (forma (N, 3, 3))
+        dummy_scale = np.ones((points_np.shape[0], 3), dtype=np.float32)
+        dummy_rotations = np.array([np.eye(3, dtype=np.float32) for _ in range(points_np.shape[0])])
+        
+        # Cria a Octree dinâmica; ela determina a profundidade máxima baseada em min_cell_size.
+        self.octree = Octree(points_np, dummy_scale, dummy_rotations, min_cell_size=0.4)
+        print("Octree criada com bounding box: min={}, max={}".format(
+            self.octree.global_min, self.octree.global_max))
+        
+        # Utiliza a escala padrão para os gaussianos:
+        # Define default_scale como um quarto do tamanho da célula (assumindo células cúbicas)
+        cell_size_np = self.octree.cell_size  # array NumPy (3,)
+        cell_size_tensor = torch.tensor(cell_size_np, device="cuda").float()
+        default_scale = cell_size_tensor / 4.0
+        # Repete o default_scale para cada ponto (resultando em shape (N, 3))
+        scales = default_scale.unsqueeze(0).repeat(fused_point_cloud.shape[0], 1)
+        
+        # Define a rotação padrão como identidade, representada pelo quaternão (1, 0, 0, 0)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
-
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-
+        
+        # Define as opacidades iniciais usando a função inverse_opacity_activation
+        opacities = self.inverse_opacity_activation(
+            0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+        )
+        
+        # Inicializa os parâmetros do modelo Gaussian
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def sync_octree(self):
+        """
+        Reconstrói a octree usando os parâmetros atuais dos gaussianos.
+        Para rotações, utiliza-se identidade para cada ponto (você pode aprimorar convertendo o
+        quaternão armazenado em _rotation para matriz, se necessário).
+        """
+        points_np = self._xyz.detach().cpu().numpy()
+        scales_np = self.get_scaling.detach().cpu().numpy()
+        N = points_np.shape[0]
+        # Para este exemplo, usamos matriz identidade para todas as rotações.
+        rotations_np = np.array([np.eye(3, dtype=np.float32) for _ in range(N)])
+        from scene.octree import Octree  # Certifique-se de que essa importação está correta
+        self.octree = Octree(points_np, scales_np, rotations_np, min_cell_size=0.4)
+    
+    def enforce_max_points_per_node(self, max_points=20):
+        """
+        Garante que nenhum nó (célula) da octree contenha mais de 'max_points' pontos.
+        Para cada célula com mais de 'max_points', é calculado um score para cada ponto, definido como:
+        
+            score = opacidade / (norma_da_escala + eps)
+        
+        Os pontos com menor score (menos relevantes, isto é, baixa opacidade em relação ao tamanho) são removidos.
+        Após a remoção, a octree é re-sincronizada.
+        """
+        eps = 1e-6
+        # Obtém a escala ativa (aplicando a função de ativação) e calcula sua norma
+        scales = self.get_scaling.detach().cpu().numpy()  # shape: (N, 3)
+        scale_norms = np.linalg.norm(scales, axis=1)  # tamanho de cada ponto
+        # Obtém as opacidades ativas (aplicando a função sigmoide)
+        opacities = self.get_opacity.detach().cpu().numpy().squeeze()  # shape: (N,)
+        # Define o score: quanto maior o valor, melhor (alta opacidade e baixa escala são prioritários)
+        scores = opacities * (scale_norms + eps)
+        
+        indices_to_remove = set()
+        # Percorre cada célula da octree
+        for cell, indices in self.octree.cells.items():
+            if len(indices) > max_points:
+                # Ordena os índices dessa célula pelo score (menor primeiro)
+                sorted_indices = sorted(indices, key=lambda i: scores[i])
+                num_remove = len(indices) - max_points
+                for i in sorted_indices[:num_remove]:
+                    indices_to_remove.add(i)
+                    
+        if len(indices_to_remove) > 0:
+            print(f"Enforcing max points per node: removendo {len(indices_to_remove)} pontos")
+            N = self.get_xyz.shape[0]
+            mask = np.zeros(N, dtype=bool)
+            for i in indices_to_remove:
+                mask[i] = True
+            # remove os pontos cujo mask é True
+            self.prune_points(mask)
+            # Após a remoção, reconstrói a octree para refletir as alterações
+            self.sync_octree()
+
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -167,6 +293,7 @@ class GaussianModel:
                                                     max_steps=training_args.position_lr_max_steps)
 
     def update_learning_rate(self, iteration):
+        # print("Updating learning rate, iteration: ", iteration)
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
