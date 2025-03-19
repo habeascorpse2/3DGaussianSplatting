@@ -42,8 +42,10 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int, min_cell_size : float, max_gaussian_per_node : int):
         self.active_sh_degree = 0
+        self.min_cell_size = min_cell_size
+        self.max_gaussian_per_node = max_gaussian_per_node
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -186,7 +188,7 @@ class GaussianModel:
         dummy_rotations = np.array([np.eye(3, dtype=np.float32) for _ in range(points_np.shape[0])])
         
         # Cria a Octree dinâmica; ela determina a profundidade máxima baseada em min_cell_size.
-        self.octree = Octree(points_np, dummy_scale, dummy_rotations, min_cell_size=0.4)
+        self.octree = Octree(points_np, dummy_scale, dummy_rotations, min_cell_size=self.min_cell_size)
         print("Octree criada com bounding box: min={}, max={}".format(
             self.octree.global_min, self.octree.global_max))
         
@@ -229,7 +231,7 @@ class GaussianModel:
         # Para este exemplo, usamos matriz identidade para todas as rotações.
         rotations_np = np.array([np.eye(3, dtype=np.float32) for _ in range(N)])
         from scene.octree import Octree  # Certifique-se de que essa importação está correta
-        self.octree = Octree(points_np, scales_np, rotations_np, min_cell_size=0.4)
+        self.octree = Octree(points_np, scales_np, rotations_np, min_cell_size=self.min_cell_size)
     
     def enforce_max_points_per_node(self, max_points=20):
         """
